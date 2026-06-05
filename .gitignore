@@ -1,0 +1,4 @@
+﻿brain.pkl
+vocab.json
+__pycache__/
+*.pyc
