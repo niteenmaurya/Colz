@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 import math
 
-
 # Device auto-select: CUDA > MPS (Apple) > CPU
 DEVICE = (
     torch.device("cuda")  if torch.cuda.is_available() else
@@ -24,7 +23,6 @@ DEVICE = (
     torch.device("cpu")
 )
 print(f"[Transformer] Using device: {DEVICE}")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GPT Model
@@ -85,34 +83,38 @@ class GPT(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # forward() — accepts list of ints (same API as pure Python version)
+    # forward() — accepts list of ints OR torch.Tensor
     # ──────────────────────────────────────────────────────────────────────────
 
     def forward(self, token_ids) -> list:
         """
         Args:
-            token_ids : list of int  OR  torch.Tensor (seq_len,)
+            token_ids : list of int  OR  torch.Tensor (batch, seq_len)
         
         Returns:
-            logits : list of lists  (seq_len, vocab_size)
-                     — matches pure-Python API so trainer.py works unchanged
+            logits : list of lists  (seq_len, vocab_size) or torch.Tensor
         """
-        if isinstance(token_ids, list):
+        is_list = isinstance(token_ids, list)
+        if is_list:
             ids = torch.tensor(token_ids, dtype=torch.long, device=DEVICE)
         else:
             ids = token_ids.to(DEVICE)
 
-        seq_len = ids.shape[0]
+        # Safe 2D conversion for single sequences
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+
+        B, T = ids.shape
 
         # Clamp to max_seq_len
-        if seq_len > self.max_seq_len:
-            ids     = ids[-self.max_seq_len:]
-            seq_len = self.max_seq_len
+        if T > self.max_seq_len:
+            ids = ids[:, -self.max_seq_len:]
+            T = self.max_seq_len
 
-        pos = torch.arange(seq_len, device=DEVICE)
+        pos = torch.arange(T, device=DEVICE).unsqueeze(0)  # Shape: (1, T)
 
-        # Embeddings
-        x = self.token_emb(ids) + self.pos_emb(pos)   # (seq, d_model)
+        # Embeddings (pos matches broad-casting rules)
+        x = self.token_emb(ids) + self.pos_emb(pos)   # (B, T, d_model)
 
         # Transformer blocks
         for block in self.blocks:
@@ -120,21 +122,15 @@ class GPT(nn.Module):
 
         # Final norm + LM head
         x      = self.ln_final(x)
-        logits = self.lm_head(x)                       # (seq, vocab_size)
+        logits = self.lm_head(x)                      # (B, T, vocab_size)
 
-        # Save tensor for trainer (backward needs it)
+        # Save tensor for trainer (backward compatibility)
         self._last_logits_tensor = logits
 
-        # Return as list-of-lists for compatibility with cross_entropy_loss()
-        return logits.tolist()
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # backward() — called by Trainer.train_step()
-    # trainer.py calls: loss, dlogits = cross_entropy_loss(logits, targets)
-    #                   model.backward(dlogits)
-    # We SKIP the Python cross_entropy and use PyTorch's own loss instead.
-    # See trainer.py — we override train_step() there.
-    # ──────────────────────────────────────────────────────────────────────────
+        # If input was list, return as list-of-lists (matching old compatibility specs)
+        if is_list:
+            return logits[0].tolist()
+        return logits
 
     def backward(self, dlogits) -> None:
         """
@@ -153,7 +149,6 @@ class GPT(nn.Module):
     def all_params_and_grads(self) -> list:
         """
         Returns list of (param_list, grad_list, name) — matches pure-Python API.
-        trainer.py's AdamOptimizer is BYPASSED; PyTorch Adam is used instead.
         This method is kept so count_parameters() and gradient clipping work.
         """
         result = []
@@ -191,7 +186,7 @@ class _TransformerBlock(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Causal Self-Attention
+# Causal Self-Attention (Fully Vectorized 3D Batch Compatible)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _CausalSelfAttention(nn.Module):
@@ -206,33 +201,35 @@ class _CausalSelfAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len, d_model = x.shape
+        B, T, C = x.shape  # Supports 3D Batch Shape directly!
 
         # QKV projections in one shot
-        qkv = self.qkv_proj(x)                             # (seq, 3*D)
-        q, k, v = qkv.split(d_model, dim=-1)               # each: (seq, D)
+        qkv = self.qkv_proj(x)                                 # (B, T, 3*C)
+        
+        # 🔥 FIX: chunk(3) ensures 3 equal tensors regardless of shape variations
+        q, k, v = qkv.chunk(3, dim=-1)                         # each: (B, T, C)
 
-        # Reshape to (n_heads, seq, d_head)
-        q = q.view(seq_len, self.n_heads, self.d_head).transpose(0, 1)
-        k = k.view(seq_len, self.n_heads, self.d_head).transpose(0, 1)
-        v = v.view(seq_len, self.n_heads, self.d_head).transpose(0, 1)
+        # Reshape to (B, n_heads, T, d_head) for parallel multi-head attention
+        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
         # Scaled dot-product attention + causal mask
         scale  = 1.0 / math.sqrt(self.d_head)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale   # (h, seq, seq)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale   # (B, h, T, T)
 
         # Causal mask (upper triangle = -inf)
         mask = torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=x.device),
+            torch.full((T, T), float('-inf'), device=x.device),
             diagonal=1
         )
         scores = scores + mask
 
-        attn = torch.softmax(scores, dim=-1)                    # (h, seq, seq)
-        out  = torch.matmul(attn, v)                            # (h, seq, d_head)
+        attn = torch.softmax(scores, dim=-1)                    # (B, h, T, T)
+        out  = torch.matmul(attn, v)                            # (B, h, T, d_head)
 
         # Merge heads
-        out = out.transpose(0, 1).contiguous().view(seq_len, d_model)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(out)
 
 

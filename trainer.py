@@ -15,7 +15,7 @@ DEVICE = (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Adam Optimizer Mock Stub for Backward Compatibility (Matches main.py legacy)
+# Stubs for backward compatibility with older legacy scripts
 # ─────────────────────────────────────────────────────────────────────────────
 class AdamOptimizer:
     def __init__(self, lr=3e-4, beta1=0.9, beta2=0.999, eps=1e-8, wd=0.01):
@@ -30,7 +30,7 @@ def cross_entropy_loss(logits: list, targets: list) -> tuple:
     return 0.0, []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HIGH-SPEED PARALLEL GPU BATCH TRAINER
+# HIGH-SPEED PARALLEL GPU BATCH TRAINER (WITH DYNAMIC PADDING)
 # ─────────────────────────────────────────────────────────────────────────────
 class Trainer:
     def __init__(
@@ -42,7 +42,7 @@ class Trainer:
         self.model    = model
         self.max_norm = max_norm
 
-        # Professional AdamW Optimizer used by modern LLMs (Matches GPT-3 setup)
+        # PyTorch built-in AdamW Optimizer for stable Transformer training
         self.torch_optimizer = optim.AdamW(
             model.parameters(),
             lr=lr,
@@ -55,72 +55,77 @@ class Trainer:
         self.loss_history: list = []
         self._loss_fn = nn.CrossEntropyLoss(ignore_index=0)   # PAD_ID = 0
 
-    def train_step(self, batch_windows: list) -> float:
+    def train_step(self, batch_windows: list, seq_len: int) -> float:
         """
-        Processes the entire batch of sequences concurrently as a single 2D tensor.
-        Eliminates Python loops entirely inside the step to utilize maximum GPU cores.
+        Processes an entire batch of sequences concurrently as a single 2D tensor.
+        Ensures perfect sequence-length alignment inside the batch using dynamic padding.
         """
         self.torch_optimizer.zero_grad()
         
-        # Step 1: Collect inputs and targets from the batch windows
         inputs_list = []
         targets_list = []
         
         for token_ids in batch_windows:
             if len(token_ids) < 2:
                 continue
-            inputs_list.append(token_ids[:-1])
-            targets_list.append(token_ids[1:])
+            
+            inp = token_ids[:-1]
+            tgt = token_ids[1:]
+            
+            # Safe truncation if the loaded tokens exceed the model's capacity limit
+            if len(inp) > seq_len:
+                inp = inp[-seq_len:]
+                tgt = tgt[-seq_len:]
+                
+            # Dynamic Padding: Pads smaller sequences to match EXACTLY 'seq_len'
+            pad_len = seq_len - len(inp)
+            if pad_len > 0:
+                inp = inp + [0] * pad_len
+                tgt = tgt + [0] * pad_len
+                
+            inputs_list.append(inp)
+            targets_list.append(tgt)
             
         if not inputs_list:
             return 0.0
 
-        # Step 2: Convert to high-speed PyTorch long tensors directly on the selected GPU/Device
+        # Converts to ultra-fast PyTorch long tensors on the targeted device (GPU/MPS/CPU)
         inp_t = torch.tensor(inputs_list,  dtype=torch.long,  device=DEVICE)
         tgt_t = torch.tensor(targets_list, dtype=torch.long,  device=DEVICE)
 
+        # Securely unpacks dimensions (Guaranteed 2D shape [Batch, Sequence_Length])
         B, T = inp_t.shape
 
-        # Step 3: Run the combined forward pass over all batches simultaneously
         try:
             with torch.enable_grad():
-                # Clamp sequence lengths safely if they exceed max configuration
-                if T > self.model.max_seq_len:
-                    inp_t = inp_t[:, -self.model.max_seq_len:]
-                    tgt_t = tgt_t[:, -self.model.max_seq_len:]
-                    T = self.model.max_seq_len
-
-                # Forward pass inside GPT model: Token Embeddings + Positional Embedding
-                pos = torch.arange(T, device=DEVICE).unsqueeze(0) # (1, T)
+                # Broadcast positional indices over the batch
+                pos = torch.arange(T, device=DEVICE).unsqueeze(0)
                 
-                # Check model dimensions safely
-                x = self.model.token_emb(inp_t) + self.model.pos_emb(pos) # Broadcast positional indices over batch B
+                # Forward pass: Combined Embedding layer
+                x = self.model.token_emb(inp_t) + self.model.pos_emb(pos)
                 
-                # Forward pass through deep decoder blocks
+                # Deep Attention block computation
                 for block in self.model.blocks:
                     x = block(x)
                 
                 x = self.model.ln_final(x)
-                logits = self.model.lm_head(x) # Shape: (B, T, vocab_size)
+                logits = self.model.lm_head(x) # Shape: [B, T, Vocab_size]
 
-                # Flatten logits and targets to feed directly into the PyTorch cross entropy optimizer
+                # Flatten logits & targets, then calculate cross entropy loss (ignoring PAD tokens)
                 loss = self._loss_fn(logits.view(-1, logits.size(-1)), tgt_t.view(-1))
-                
-                # Synchronous backward propagation (Executed once per batch update step)
                 loss.backward()
 
-                # Step 4: Gradient clipping to prevent exploding gradient issues
+                # Gradient clipping to prevent gradient explosion issues
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
                 
-                # Step 5: Optimizer step to adjust weights
+                # Gradient update step
                 self.torch_optimizer.step()
                 
                 return loss.item()
 
         except Exception as e:
-            # Safety check to prevent notebook crashes during long runs
-            print(f"\n⚠️ [TRAINER DEBUG] Error captured during train_step: {str(e)}")
-            print(f"   Batch shape was: Inputs={inp_t.shape}, Targets={tgt_t.shape}")
+            # Handles errors cleanly to prevent crashing mid-training run
+            print(f"\n⚠️ [TRAINER DEBUG] Error during train_step processing: {str(e)}")
             return 0.0
 
     def train(
@@ -128,18 +133,18 @@ class Trainer:
         all_token_ids: list,
         seq_len:       int,
         epochs:        int,
-        log_every:     int = 10,
+        log_every:     int = 5,
     ) -> None:
         """
-        Triggers the ultra-fast batch training pipeline across T4 GPUs.
+        Triggers the highly optimized parallel training loops.
         """
-        # Calculate optimal slice window sequences
+        # Slice corpus tokens into aligned sliding context windows
         windows = [all_token_ids[s : s + seq_len + 1] for s in range(0, len(all_token_ids) - seq_len, seq_len)]
         if not windows:
-            print("[Trainer] Corpus too short to create sliding token windows.")
-            return
+            # Fallback if corpus length is shorter than the configured context length
+            windows = [all_token_ids]
 
-        batch_size = 64  # Optimal batch size configured for deep GPU execution
+        batch_size = 64  # Vectorized batch processing size
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.torch_optimizer,
             T_max=epochs,
@@ -147,7 +152,7 @@ class Trainer:
         )
 
         print("=" * 65)
-        print(f"🔥 GPT ENGINE TRIPLE-ACCELERATED!")
+        print(f"🔥 GPT ENGINE ACCELERATED (DYNAMIC PADDING ACTIVE)!")
         print(f"👉 Target Device : {DEVICE.type.upper()}")
         print(f"👉 Batch Size    : {batch_size} sequences/step")
         print(f"👉 Total Params  : {self.model.count_parameters():,}")
@@ -161,19 +166,14 @@ class Trainer:
             epoch_start_time = time.time()
             random.shuffle(windows)
             
-            # Split windows into fully vectorized batches of batch_size=64
+            # Chunk the shuffled windows into uniform batches of size 64
             batches = [windows[i : i + batch_size] for i in range(0, len(windows), batch_size)]
             
             epoch_loss = 0.0
             steps_run = 0
             
             for b in batches:
-                # We filter out windows that aren't of exact correct length to enforce true matrix alignment
-                aligned_batch = [w for w in b if len(w) == seq_len + 1]
-                if not aligned_batch:
-                    continue
-                
-                loss_val = self.train_step(aligned_batch)
+                loss_val = self.train_step(b, seq_len)
                 epoch_loss += loss_val
                 steps_run += 1
             
@@ -181,12 +181,12 @@ class Trainer:
             self.loss_history.append(avg_loss)
             scheduler.step()
 
-            # Dynamic logs to keep track of the training speed in real-time
+            # Dynamic logs to keep track of training metrics (Logs every 5 epochs)
             if epoch % log_every == 0 or epoch == 1:
                 ppl = math.exp(min(avg_loss, 20))
                 lr  = self.torch_optimizer.param_groups[0]['lr']
                 elapsed = time.time() - epoch_start_time
-                print(f" 🌟 epoch {epoch:4d}/{epochs} | loss={avg_loss:.4f} | ppl={ppl:.2f} | lr={lr:.2e} | step_time={elapsed:.4f}s")
+                print(f" 🌟 epoch {epoch:4d}/{epochs} | loss={avg_loss:.4f} | ppl={ppl:.2f} | lr={lr:.2e} | time={elapsed:.4f}s")
 
         total_time = time.time() - start_time
         print("=" * 65)
