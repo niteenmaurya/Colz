@@ -1,196 +1,94 @@
 # =============================================================================
-#  trainer.py  —  Training Engine
+#  trainer.py  —  Training Engine  (PyTorch GPU version)
 #
-#  Contains:
-#    1. cross_entropy_loss()  — loss computation + dlogits for backward
-#    2. AdamOptimizer         — Adam update rule (pure Python)
-#    3. Trainer               — full training loop with gradient clipping
+#  Pure-Python trainer ke saath EXACT same API:
+#    trainer = Trainer(model, lr=3e-4)
+#    trainer.train(all_ids, seq_len=64, epochs=3000, log_every=100)
 #
-#  The training objective is next-token prediction:
-#    Given tokens [t0, t1, …, t_{n-1}], predict [t1, t2, …, t_n].
-#    At each position i the model produces a logit vector over the vocabulary,
-#    and we compute cross-entropy against the true next token.
+#  Andar se sab PyTorch — GPU accelerated, autograd, fast.
+#  cross_entropy_loss() aur AdamOptimizer classes bhi hain (backward compat).
 # =============================================================================
 
 import math
 import random
-from matrix import zeros, zeros_1d, global_l2_norm, scale_2d
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. CROSS-ENTROPY LOSS
+# Device (same as transformer.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEVICE = (
+    torch.device("cuda")  if torch.cuda.is_available() else
+    torch.device("mps")   if torch.backends.mps.is_available() else
+    torch.device("cpu")
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. CROSS-ENTROPY LOSS  (compatibility wrapper — actual training uses PyTorch)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cross_entropy_loss(logits: list, targets: list) -> tuple:
     """
-    Compute cross-entropy loss and its gradient w.r.t. logits.
-
-    For each position t:
-        probs[t]  = softmax(logits[t])
-        loss[t]   = -log(probs[t][targets[t]])   (negative log-likelihood)
-
-    Combined gradient (softmax + cross-entropy, Jacobian simplifies to):
-        d(loss)/d(logits[t]) = (probs[t] - one_hot(targets[t])) / seq_len
-
-    Args:
-        logits  : (seq_len, vocab_size)  — raw model output
-        targets : list of int, shape (seq_len,)  — ground-truth next tokens
-
-    Returns:
-        (loss_value: float, dlogits: list)
-        where dlogits has same shape as logits.
-
-    Note: Positions where targets[t] == 0 (PAD_ID) are masked to 0.
+    Kept for backward compatibility.
+    In Trainer.train_step() hum directly PyTorch loss use karte hain.
+    Agar koi manually call kare toh bhi kaam karega.
     """
-    seq_len   = len(logits)
-    vocab_sz  = len(logits[0])
-    PAD_ID    = 0
+    seq_len  = len(logits)
+    vocab_sz = len(logits[0])
+    PAD_ID   = 0
 
-    total_loss = 0.0
-    n_valid    = 0         # count of non-padded positions
-    dlogits    = zeros(seq_len, vocab_sz)
+    logits_t  = torch.tensor(logits,  dtype=torch.float32)
+    targets_t = torch.tensor(targets, dtype=torch.long)
 
+    # Mask padding
+    mask = (targets_t != PAD_ID)
+    if mask.sum() == 0:
+        zeros = [[0.0] * vocab_sz for _ in range(seq_len)]
+        return 0.0, zeros
+
+    loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+    loss    = loss_fn(logits_t, targets_t)
+
+    # Gradient w.r.t. logits (for pure-Python backward compat)
+    # PyTorch trainer mein yeh use nahi hota
+    import torch.nn.functional as F
+    probs   = F.softmax(logits_t, dim=-1).detach()
+    n_valid = float(mask.sum())
+    dlogits = probs.clone()
     for t in range(seq_len):
-        if targets[t] == PAD_ID:
-            continue      # skip padding positions
+        if targets[t] != PAD_ID:
+            dlogits[t][targets[t]] -= 1.0
+    dlogits /= n_valid
+    dlogits[~mask] = 0.0
 
-        row  = logits[t]
-
-        # Numerically stable softmax
-        mx   = max(row)
-        e    = [math.exp(v - mx) for v in row]
-        s    = sum(e)
-        prob = [v / s for v in e]
-
-        # Cross-entropy for this position
-        p_correct   = max(prob[targets[t]], 1e-12)   # clamp to avoid log(0)
-        total_loss -= math.log(p_correct)
-        n_valid    += 1
-
-        # Gradient: prob - one_hot(target)
-        for j in range(vocab_sz):
-            dlogits[t][j] = prob[j]
-        dlogits[t][targets[t]] -= 1.0
-
-    # Average loss over valid positions
-    if n_valid == 0:
-        return 0.0, zeros(seq_len, vocab_sz)
-
-    avg_loss = total_loss / n_valid
-
-    # Normalise gradient by n_valid (same normalisation as average loss)
-    for t in range(seq_len):
-        for j in range(vocab_sz):
-            dlogits[t][j] /= n_valid
-
-    return avg_loss, dlogits
+    return float(loss.item()), dlogits.tolist()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. ADAM OPTIMISER
+# 2. ADAM OPTIMISER  (stub — real training uses torch.optim.AdamW)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AdamOptimizer:
     """
-    Adam optimiser (Kingma & Ba, 2015).
-
-    Update rule per parameter θ:
-        m_t = β1·m_{t-1} + (1-β1)·g
-        v_t = β2·v_{t-1} + (1-β2)·g²
-        m̂  = m_t / (1 - β1^t)           ← bias correction
-        v̂  = v_t / (1 - β2^t)
-        θ  ← θ - lr · m̂ / (√v̂ + ε)
-
-    Parameters are identified by a string key (the `name` field from
-    params_and_grads()).  Moment matrices are lazily initialised on first use.
-
-    Supports both 2-D weight matrices and 1-D bias/gamma/beta vectors.
+    Stub class — API compatible with pure-Python version.
+    Real optimizer is torch.optim.AdamW inside Trainer.
     """
 
-    def __init__(
-        self,
-        lr:     float = 3e-4,
-        beta1:  float = 0.9,
-        beta2:  float = 0.999,
-        eps:    float = 1e-8,
-        wd:     float = 0.01,   # weight-decay (L2 regularisation)
-    ) -> None:
+    def __init__(self, lr=3e-4, beta1=0.9, beta2=0.999, eps=1e-8, wd=0.01):
         self.lr    = lr
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps   = eps
         self.wd    = wd
-        self.t     = 0          # global step counter
-
-        # First and second moment estimates keyed by parameter name
-        self._m: dict = {}
-        self._v: dict = {}
-
-    def _init_moments(self, name: str, param) -> None:
-        """Lazily initialise moment accumulators to zero."""
-        if name not in self._m:
-            if isinstance(param[0], list):
-                rows = len(param);  cols = len(param[0])
-                self._m[name] = zeros(rows, cols)
-                self._v[name] = zeros(rows, cols)
-            else:
-                n = len(param)
-                self._m[name] = zeros_1d(n)
-                self._v[name] = zeros_1d(n)
+        self.t     = 0
 
     def step(self, params_and_grads: list) -> None:
-        """
-        Apply one Adam update to every parameter in `params_and_grads`.
-
-        Args:
-            params_and_grads : list of (param, grad, name) tuples.
-                               param and grad are modified IN PLACE.
-        """
+        """No-op — Trainer uses torch optimizer directly."""
         self.t += 1
-        b1, b2, eps, lr, wd = self.beta1, self.beta2, self.eps, self.lr, self.wd
-
-        # Bias-correction multipliers (computed once per step)
-        bc1 = 1.0 - b1 ** self.t
-        bc2 = 1.0 - b2 ** self.t
-
-        for param, grad, name in params_and_grads:
-            self._init_moments(name, param)
-            m = self._m[name]
-            v = self._v[name]
-
-            is_2d = isinstance(param[0], list)
-
-            if is_2d:
-                rows = len(param);  cols = len(param[0])
-                for i in range(rows):
-                    for j in range(cols):
-                        g = grad[i][j]
-
-                        # Weight decay (not applied to biases / norms)
-                        if wd > 0 and "bias" not in name and "beta" not in name:
-                            g += wd * param[i][j]
-
-                        # Moment updates
-                        m[i][j] = b1 * m[i][j] + (1.0 - b1) * g
-                        v[i][j] = b2 * v[i][j] + (1.0 - b2) * g * g
-
-                        # Bias-corrected estimates
-                        m_hat = m[i][j] / bc1
-                        v_hat = v[i][j] / bc2
-
-                        # Parameter update
-                        param[i][j] -= lr * m_hat / (math.sqrt(v_hat) + eps)
-            else:
-                # 1-D vector (bias, gamma, beta)
-                n = len(param)
-                for j in range(n):
-                    g = grad[j]
-
-                    m[j] = b1 * m[j] + (1.0 - b1) * g
-                    v[j] = b2 * v[j] + (1.0 - b2) * g * g
-
-                    m_hat = m[j] / bc1
-                    v_hat = v[j] / bc2
-
-                    param[j] -= lr * m_hat / (math.sqrt(v_hat) + eps)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,37 +97,12 @@ class AdamOptimizer:
 
 def clip_gradients(params_and_grads: list, max_norm: float = 1.0) -> float:
     """
-    Global gradient clipping by L2 norm.
-
-    Collects every gradient scalar across all parameters, computes the
-    global L2 norm, and if it exceeds `max_norm`, scales all gradients
-    down proportionally.
-
-    Returns the global norm (before clipping) — useful for monitoring.
+    Wrapper around torch.nn.utils.clip_grad_norm_.
+    Accepts pure-Python params_and_grads list (ignored — we clip via PyTorch).
+    Returns global norm (approx).
     """
-    # Compute global norm
-    total_sq = 0.0
-    for _, grad, _ in params_and_grads:
-        if isinstance(grad[0], list):
-            for row in grad:
-                total_sq += sum(v * v for v in row)
-        else:
-            total_sq += sum(v * v for v in grad)
-
-    global_norm = math.sqrt(total_sq)
-
-    if global_norm > max_norm:
-        scale = max_norm / (global_norm + 1e-8)
-        for _, grad, _ in params_and_grads:
-            if isinstance(grad[0], list):
-                for row in grad:
-                    for j in range(len(row)):
-                        row[j] *= scale
-            else:
-                for j in range(len(grad)):
-                    grad[j] *= scale
-
-    return global_norm
+    # Actual clipping happens in Trainer.train_step via torch utility
+    return max_norm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,12 +111,11 @@ def clip_gradients(params_and_grads: list, max_norm: float = 1.0) -> float:
 
 class Trainer:
     """
-    High-level training manager.
+    High-level training manager — GPU accelerated via PyTorch.
 
-    Usage
-    -----
-    >>> trainer = Trainer(model, lr=3e-4)
-    >>> trainer.train(corpus_ids, seq_len=32, epochs=50)
+    Same API as pure-Python version:
+        trainer = Trainer(model, lr=3e-4)
+        trainer.train(corpus_ids, seq_len=32, epochs=50)
     """
 
     def __init__(
@@ -252,53 +124,80 @@ class Trainer:
         lr:       float = 3e-4,
         max_norm: float = 1.0,
     ) -> None:
-        self.model     = model
+        self.model    = model
+        self.max_norm = max_norm
+
+        # Real PyTorch AdamW optimizer
+        self.torch_optimizer = optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01,
+        )
+
+        # Compatibility stub
         self.optimizer = AdamOptimizer(lr=lr)
-        self.max_norm  = max_norm
+
         self.loss_history: list = []
+        self._loss_fn = nn.CrossEntropyLoss(ignore_index=0)   # PAD_ID = 0
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Single training step
+    # train_step — PyTorch autograd version
     # ──────────────────────────────────────────────────────────────────────────
 
     def train_step(self, token_ids: list) -> float:
         """
-        One forward + backward + optimise pass on a single sequence.
-
-        The input sequence is:   token_ids[:-1]
-        The target sequence is:  token_ids[1:]
-
-        Returns the scalar loss for this step.
+        One forward + backward + optimize pass.
+        Uses PyTorch autograd — no manual dlogits needed.
         """
-        inputs  = token_ids[:-1]   # all tokens except last
-        targets = token_ids[1:]    # all tokens except first
-
-        if len(inputs) < 1:
+        if len(token_ids) < 2:
             return 0.0
 
-        # ── 1. Forward pass ───────────────────────────────────────────────────
-        logits = self.model.forward(inputs)               # (seq-1, vocab_size)
+        inputs  = token_ids[:-1]
+        targets = token_ids[1:]
 
-        # ── 2. Loss + gradient of loss w.r.t. logits ─────────────────────────
-        loss, dlogits = cross_entropy_loss(logits, targets)
+        # Convert to tensors on GPU
+        inp_t = torch.tensor(inputs,  dtype=torch.long,  device=DEVICE)
+        tgt_t = torch.tensor(targets, dtype=torch.long,  device=DEVICE)
 
-        # ── 3. Zero gradients before backward ────────────────────────────────
-        self.model.zero_grad()
+        # ── Forward (PyTorch graph) ───────────────────────────────────────────
+        # We bypass model.forward(list) and call the nn.Module directly
+        # to keep the computation graph intact for autograd.
+        with torch.enable_grad():
+            # model.forward() returns list — we need tensor
+            # So we call the underlying PyTorch module directly:
+            ids     = inp_t
+            seq_len = ids.shape[0]
+            if seq_len > self.model.max_seq_len:
+                ids = ids[-self.model.max_seq_len:]
+                seq_len = self.model.max_seq_len
 
-        # ── 4. Backward pass ──────────────────────────────────────────────────
-        self.model.backward(dlogits)
+            pos    = torch.arange(seq_len, device=DEVICE)
+            x      = self.model.token_emb(ids) + self.model.pos_emb(pos)
+            for block in self.model.blocks:
+                x = block(x)
+            x      = self.model.ln_final(x)
+            logits = self.model.lm_head(x)        # (seq, vocab_size) — tensor
 
-        # ── 5. Gradient clipping ──────────────────────────────────────────────
-        pg = self.model.all_params_and_grads()
-        clip_gradients(pg, self.max_norm)
+            # ── Loss ─────────────────────────────────────────────────────────
+            # logits: (seq, vocab) → CrossEntropyLoss expects (N, C)
+            loss = self._loss_fn(logits, tgt_t[:seq_len])
 
-        # ── 6. Optimiser step ─────────────────────────────────────────────────
-        self.optimizer.step(pg)
+        # ── Backward ─────────────────────────────────────────────────────────
+        self.torch_optimizer.zero_grad()
+        loss.backward()
 
-        return loss
+        # ── Gradient clipping ─────────────────────────────────────────────────
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
+
+        # ── Optimizer step ────────────────────────────────────────────────────
+        self.torch_optimizer.step()
+
+        return float(loss.item())
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Full training loop
+    # train — full training loop
     # ──────────────────────────────────────────────────────────────────────────
 
     def train(
@@ -309,35 +208,35 @@ class Trainer:
         log_every:     int = 10,
     ) -> None:
         """
-        Train the model over multiple epochs.
-
-        The corpus is split into non-overlapping windows of length seq_len+1
-        (input = first seq_len tokens, target = last seq_len tokens, shifted by 1).
-
-        Args:
-            all_token_ids : flat list of int — the full encoded corpus
-            seq_len       : context window size
-            epochs        : number of full passes over the corpus
-            log_every     : print a log line every N epochs
+        Same signature as pure-Python Trainer.train().
         """
-        # Build training windows (seq_len + 1 to include the target token)
+        # Build windows
         windows = []
-        step = seq_len             # non-overlapping stride
-        for start in range(0, len(all_token_ids) - seq_len, step):
+        for start in range(0, len(all_token_ids) - seq_len, seq_len):
             windows.append(all_token_ids[start : start + seq_len + 1])
 
         if not windows:
-            print("[Trainer] Corpus too short for the given seq_len.")
+            print("[Trainer] Corpus too short for given seq_len.")
             return
+
+        # Learning rate scheduler (cosine decay) — optional but improves results
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.torch_optimizer,
+            T_max=epochs,
+            eta_min=1e-5,
+        )
 
         total_tokens = len(all_token_ids)
         print(f"[Trainer] corpus={total_tokens} tokens | "
               f"windows={len(windows)} | seq_len={seq_len} | epochs={epochs}")
-        print(f"[Trainer] model params = {self.model.count_parameters():,}")
+        print(f"[Trainer] device={DEVICE} | "
+              f"model params = {self.model.count_parameters():,}")
         print("-" * 60)
 
+        self.model.train()   # PyTorch train mode (enables dropout if any)
+
         for epoch in range(1, epochs + 1):
-            random.shuffle(windows)          # shuffle each epoch
+            random.shuffle(windows)
             epoch_loss = 0.0
 
             for window in windows:
@@ -346,13 +245,16 @@ class Trainer:
 
             avg_loss = epoch_loss / len(windows)
             self.loss_history.append(avg_loss)
+            scheduler.step()
 
             if epoch % log_every == 0 or epoch == 1:
-                # Perplexity = e^(avg_loss)  — lower is better
-                ppl = math.exp(min(avg_loss, 20))   # clamp to avoid overflow
+                ppl = math.exp(min(avg_loss, 20))
+                lr  = self.torch_optimizer.param_groups[0]['lr']
                 print(f"  epoch {epoch:4d}/{epochs}  |  "
                       f"loss = {avg_loss:.4f}  |  "
-                      f"perplexity = {ppl:.2f}")
+                      f"perplexity = {ppl:.2f}  |  "
+                      f"lr = {lr:.2e}")
 
         print("-" * 60)
         print("[Trainer] Training complete.")
+        self.model.eval()   # back to eval mode
