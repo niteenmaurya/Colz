@@ -60,7 +60,7 @@ class Trainer:
 
         # Mixed-precision scaler (only active on CUDA)
         self._use_amp = (DEVICE.type == "cuda")
-        self.scaler   = torch.cuda.amp.GradScaler(enabled=self._use_amp)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self._use_amp)
 
         self.loss_history: list = []
         self._loss_fn = nn.CrossEntropyLoss(ignore_index=0)   # PAD_ID = 0
