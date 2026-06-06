@@ -1,253 +1,184 @@
 # =============================================================================
-#  inference.py  —  Text Generation (Inference)
+#  inference.py  —  Text Generation
 #
-#  Three decoding strategies, all pure Python:
+#  Strategies:
+#    greedy     — highest-prob token, deterministic
+#    sample     — multinomial sampling with temperature
+#    top_k      — top-K filtered sampling with temperature
 #
-#  1. greedy()       — always picks the single highest-probability token.
-#                      Fast, deterministic, but repetitive.
-#
-#  2. sample()       — draws from the full distribution (with temperature).
-#                      temperature < 1  →  more focused/conservative
-#                      temperature > 1  →  more creative/random
-#                      temperature = 1  →  unmodified distribution
-#
-#  3. top_k_sample() — same as sample() but only considers the top-K tokens.
-#                      Prevents extremely unlikely tokens from being chosen.
-#
-#  All generators share the same autoregressive loop:
-#      prompt  →  [encode]  →  feed to model  →  pick next token  →  append  →  repeat
+#  All generation stays on GPU (no Python loop over logits).
+#  model.forward() is called with a torch.Tensor directly so the
+#  GPU never has to round-trip through Python lists during inference.
 # =============================================================================
 
-import math
-import random
+import torch
+import torch.nn.functional as F
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Device (matches transformer.py / trainer.py)
+# ─────────────────────────────────────────────────────────────────────────────
+DEVICE = (
+    torch.device("cuda") if torch.cuda.is_available() else
+    torch.device("mps")  if torch.backends.mps.is_available() else
+    torch.device("cpu")
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
+# Internal helpers  (all tensor-native, no Python loops over vocab)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _softmax_1d(x: list) -> list:
-    """Numerically stable softmax for a 1-D list."""
-    mx = max(x)
-    e  = [math.exp(v - mx) for v in x]
-    s  = sum(e)
-    return [v / s for v in e]
+@torch.no_grad()
+def _get_next_logits(model, ids_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Run model on ids_tensor (1, T) and return logits for the LAST position.
+    Shape returned: (vocab_size,)
+    Stays entirely on DEVICE — no .tolist() round-trip.
+    """
+    T = ids_tensor.shape[1]
+    if T > model.max_seq_len:
+        ids_tensor = ids_tensor[:, -model.max_seq_len:]
 
-def _apply_temperature(logits: list, temperature: float) -> list:
-    """Divide every logit by temperature before softmax."""
+    # Call model's internal forward directly to avoid the list→tensor overhead
+    # in the public forward() compatibility wrapper
+    pos    = torch.arange(ids_tensor.shape[1], device=DEVICE).unsqueeze(0)
+    x      = model.token_emb(ids_tensor) + model.pos_emb(pos)
+    for block in model.blocks:
+        x = block(x)
+    x      = model.ln_final(x)
+    logits = model.lm_head(x)          # (1, T, vocab_size)
+    return logits[0, -1, :]            # (vocab_size,)
+
+
+def _apply_temperature(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     if temperature <= 0:
         raise ValueError("temperature must be > 0")
-    return [v / temperature for v in logits]
+    return logits / temperature
 
-def _greedy_pick(probs: list) -> int:
-    """Return the index of the highest probability."""
-    best_idx = 0
-    best_val = probs[0]
-    for i, p in enumerate(probs):
-        if p > best_val:
-            best_val = p
-            best_idx = i
-    return best_idx
 
-def _multinomial_sample(probs: list) -> int:
-    """
-    Draw one sample from a discrete probability distribution.
-    Uses the CDF inversion method (no NumPy needed).
-    """
-    r = random.random()
-    cdf = 0.0
-    for i, p in enumerate(probs):
-        cdf += p
-        if r <= cdf:
-            return i
-    return len(probs) - 1   # fallback for floating-point edge cases
-
-def _top_k_filter(logits: list, k: int) -> list:
-    """
-    Set all logits outside the top-K to -infinity.
-    Returns a new list — original is not modified.
-    """
-    if k <= 0 or k >= len(logits):
-        return logits[:]
-    # Find the k-th largest value
-    sorted_logits = sorted(logits, reverse=True)
-    threshold = sorted_logits[k - 1]
-    return [v if v >= threshold else -1e9 for v in logits]
-
-def _last_logits(model, token_ids: list, max_seq_len: int) -> list:
-    """
-    Run the model on token_ids (truncated to max_seq_len if needed)
-    and return the logit vector for the LAST position.
-    This is the distribution over 'what token comes next'.
-    """
-    if len(token_ids) > max_seq_len:
-        token_ids = token_ids[-max_seq_len:]   # keep only the most recent context
-    logits = model.forward(token_ids)          # (seq_len, vocab_size)
-    return logits[-1]                          # last position → next-token logits
+def _top_k_filter(logits: torch.Tensor, k: int) -> torch.Tensor:
+    if k <= 0 or k >= logits.size(-1):
+        return logits
+    threshold = torch.topk(logits, k).values[-1]
+    return logits.masked_fill(logits < threshold, float('-inf'))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public generation functions
+# Core generation loop  (shared by all three strategies)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def _generate_loop(
+    model,
+    tokenizer,
+    prompt:      str,
+    max_new:     int,
+    temperature: float,
+    top_k:       int,         # 0 = disabled
+    greedy:      bool,
+) -> str:
+    model.eval()
+
+    prompt_ids = tokenizer.encode(prompt)
+    ids = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)  # (1, T)
+
+    generated = []
+
+    for _ in range(max_new):
+        logits = _get_next_logits(model, ids)          # (vocab_size,) on DEVICE
+
+        if greedy:
+            next_id = logits.argmax().item()
+        else:
+            if top_k > 0:
+                logits = _top_k_filter(logits, top_k)
+            logits  = _apply_temperature(logits, temperature)
+            probs   = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1).item()
+
+        if next_id == tokenizer.EOS_ID:
+            break
+
+        generated.append(next_id)
+        ids = torch.cat([
+            ids,
+            torch.tensor([[next_id]], dtype=torch.long, device=DEVICE)
+        ], dim=1)
+
+    return prompt + tokenizer.decode(generated)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API  (same signatures as before — drop-in replacement)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def greedy(
     model,
     tokenizer,
-    prompt:       str,
-    max_new:      int = 100,
-    max_seq_len:  int = 128,
-    stop_on_eos:  bool = True,
+    prompt:      str,
+    max_new:     int = 100,
+    max_seq_len: int = 128,
+    stop_on_eos: bool = True,
 ) -> str:
-    """
-    Greedy decoding: always pick the most probable next token.
-
-    Args:
-        model       : trained GPT model
-        tokenizer   : CharTokenizer with vocab built
-        prompt      : seed text string
-        max_new     : maximum number of new tokens to generate
-        max_seq_len : context window (truncate if longer)
-        stop_on_eos : stop early when EOS token is generated
-
-    Returns:
-        Generated string (does NOT include the prompt).
-    """
-    ids = tokenizer.encode(prompt)
-
-    generated = []
-    for _ in range(max_new):
-        last = _last_logits(model, ids, max_seq_len)    # (vocab_size,)
-        probs = _softmax_1d(last)
-        next_id = _greedy_pick(probs)
-
-        if stop_on_eos and next_id == tokenizer.EOS_ID:
-            break
-
-        generated.append(next_id)
-        ids = ids + [next_id]
-
-    return tokenizer.decode(generated)
+    return _generate_loop(
+        model, tokenizer, prompt,
+        max_new=max_new, temperature=1.0, top_k=0, greedy=True,
+    )
 
 
 def sample(
     model,
     tokenizer,
-    prompt:       str,
-    max_new:      int   = 100,
-    temperature:  float = 0.8,
-    max_seq_len:  int   = 128,
-    stop_on_eos:  bool  = True,
+    prompt:      str,
+    max_new:     int   = 100,
+    temperature: float = 0.8,
+    max_seq_len: int   = 128,
+    stop_on_eos: bool  = True,
 ) -> str:
-    """
-    Multinomial sampling with temperature control.
-
-    temperature = 0.7  → sharper, more confident output
-    temperature = 1.0  → vanilla sampling from model distribution
-    temperature = 1.5  → more random and creative
-
-    Args:
-        model, tokenizer, prompt, max_new, max_seq_len, stop_on_eos:
-            same as greedy()
-        temperature : float — controls sharpness of distribution
-
-    Returns:
-        Generated string (does NOT include the prompt).
-    """
-    ids = tokenizer.encode(prompt)
-
-    generated = []
-    for _ in range(max_new):
-        last    = _last_logits(model, ids, max_seq_len)
-        scaled  = _apply_temperature(last, temperature)
-        probs   = _softmax_1d(scaled)
-        next_id = _multinomial_sample(probs)
-
-        if stop_on_eos and next_id == tokenizer.EOS_ID:
-            break
-
-        generated.append(next_id)
-        ids = ids + [next_id]
-
-    return tokenizer.decode(generated)
+    return _generate_loop(
+        model, tokenizer, prompt,
+        max_new=max_new, temperature=temperature, top_k=0, greedy=False,
+    )
 
 
 def top_k_sample(
     model,
     tokenizer,
-    prompt:       str,
-    max_new:      int   = 100,
-    k:            int   = 10,
-    temperature:  float = 0.8,
-    max_seq_len:  int   = 128,
-    stop_on_eos:  bool  = True,
+    prompt:      str,
+    max_new:     int   = 100,
+    k:           int   = 10,
+    temperature: float = 0.8,
+    max_seq_len: int   = 128,
+    stop_on_eos: bool  = True,
 ) -> str:
-    """
-    Top-K sampling: restrict the candidate pool to the K most likely tokens,
-    then sample with temperature.
+    return _generate_loop(
+        model, tokenizer, prompt,
+        max_new=max_new, temperature=temperature, top_k=k, greedy=False,
+    )
 
-    This prevents highly unlikely tokens from ever being chosen, resulting
-    in more coherent text while still maintaining variety.
-
-    Args:
-        k           : number of top tokens to keep (e.g. 5, 10, 20)
-        temperature : sharpness of distribution over the top-K tokens
-        others      : same as sample()
-
-    Returns:
-        Generated string (does NOT include the prompt).
-    """
-    ids = tokenizer.encode(prompt)
-
-    generated = []
-    for _ in range(max_new):
-        last      = _last_logits(model, ids, max_seq_len)
-        filtered  = _top_k_filter(last, k)
-        scaled    = _apply_temperature(filtered, temperature)
-        probs     = _softmax_1d(scaled)
-        next_id   = _multinomial_sample(probs)
-
-        if stop_on_eos and next_id == tokenizer.EOS_ID:
-            break
-
-        generated.append(next_id)
-        ids = ids + [next_id]
-
-    return tokenizer.decode(generated)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience wrapper
-# ─────────────────────────────────────────────────────────────────────────────
 
 def generate(
     model,
     tokenizer,
     prompt:      str,
     max_new:     int   = 100,
-    strategy:    str   = "top_k",    # "greedy" | "sample" | "top_k"
+    strategy:    str   = "top_k",
     temperature: float = 0.8,
     k:           int   = 10,
     max_seq_len: int   = 128,
 ) -> str:
     """
-    Unified generation entry point.
-
-    Args:
-        strategy : one of "greedy", "sample", "top_k"
-        Others   : same as individual functions above.
-
-    Returns:
-        Generated text string (prompt + new tokens).
+    Unified entry point. strategy: 'greedy' | 'sample' | 'top_k'
+    Returns prompt + generated text.
     """
     strategy = strategy.lower()
     if strategy == "greedy":
-        new_text = greedy(model, tokenizer, prompt, max_new, max_seq_len)
+        return greedy(model, tokenizer, prompt, max_new)
     elif strategy == "sample":
-        new_text = sample(model, tokenizer, prompt, max_new, temperature, max_seq_len)
+        return sample(model, tokenizer, prompt, max_new, temperature)
     elif strategy in ("top_k", "topk"):
-        new_text = top_k_sample(model, tokenizer, prompt, max_new, k, temperature, max_seq_len)
+        return top_k_sample(model, tokenizer, prompt, max_new, k, temperature)
     else:
-        raise ValueError(f"Unknown strategy '{strategy}'. "
-                         f"Choose from: greedy, sample, top_k")
-
-    return prompt + new_text
+        raise ValueError(
+            f"Unknown strategy '{strategy}'. Choose: greedy | sample | top_k"
+        )
